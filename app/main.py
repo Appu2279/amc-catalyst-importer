@@ -27,11 +27,6 @@ _cloud_name   = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
 _cloud_key    = os.getenv("CLOUDINARY_API_KEY",    "").strip()
 _cloud_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip()
 
-# Debug: print first/last chars so you can verify without exposing full secret
-print(f"[cloudinary] cloud_name  = '{_cloud_name}'")
-print(f"[cloudinary] api_key     = '{_cloud_key}'")
-print(f"[cloudinary] api_secret  = '{_cloud_secret[:4]}...{_cloud_secret[-4:]}' (len={len(_cloud_secret)})")
-
 cloudinary.config(
     cloud_name = _cloud_name,
     api_key    = _cloud_key,
