@@ -67,6 +67,40 @@ def clean_text(text):
     return text.strip()
 
 
+# Options run A..F. The original recall format only ever used A-D, but the
+# newer prose format uses five, so nothing downstream may assume four.
+OPTION_LETTERS = "ABCDEF"
+
+
+def extract_pdf_text_pages(pdf_path):
+    """Same text as extract_pdf_text, plus where each page starts in it.
+
+    The prose format has no [Page Number] marker, so the page a question sits
+    on has to be derived from its offset in the text — and that page number is
+    what attaches the extracted images to the right question.
+    """
+    text = ""
+    page_starts = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for index, page in enumerate(pdf.pages):
+            page_starts.append((len(text), index + 1))
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text, page_starts
+
+
+def page_for_offset(page_starts, offset):
+    """Which 1-based page an offset in the concatenated text falls on."""
+    page = None
+    for start, number in page_starts or []:
+        if start <= offset:
+            page = number
+        else:
+            break
+    return page
+
+
 def extract_pdf_text(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
@@ -150,7 +184,7 @@ def get_answer_page_map(pdf_path):
 # ==========================================
 # PARSERS
 # ==========================================
-def parse_questions(text):
+def _parse_questions_labelled(text):
     questions = []
     qn_pattern = re.compile(r'Question Number:\s*(\d+)', re.IGNORECASE)
     qn_matches = list(qn_pattern.finditer(text))
@@ -198,6 +232,19 @@ def parse_questions(text):
         q_raw         = re.sub(r'\[[^\]]+\]\s*\n?', '', q_raw)
         question_text = ' '.join(q_raw.split())
 
+        options = {
+            "A": clean_text(option_match.group(1)),
+            "B": clean_text(option_match.group(2)),
+            "C": clean_text(option_match.group(3)),
+            "D": clean_text(option_match.group(4)),
+        }
+        # Five-option questions exist in newer papers; the A-D block above stays
+        # required so this cannot change how an existing paper parses.
+        for extra in ("E", "F"):
+            extra_match = re.search(rf'(?m)^{extra}\.\s*(.+)$', after_block)
+            if extra_match:
+                options[extra] = clean_text(extra_match.group(1))
+
         questions.append({
             "question_number": question_number,
             "subject":         clean_text(categories[0]) if categories else None,
@@ -211,18 +258,13 @@ def parse_questions(text):
             "image_type":      clean_text(image_type),
             "page_number":     page_number,
             "question_text":   clean_text(question_text),
-            "options": {
-                "A": clean_text(option_match.group(1)),
-                "B": clean_text(option_match.group(2)),
-                "C": clean_text(option_match.group(3)),
-                "D": clean_text(option_match.group(4)),
-            }
+            "options": options,
         })
 
     return questions
 
 
-def parse_answers(text):
+def _parse_answers_labelled(text):
     answers    = {}
     qn_pattern = re.compile(r'Question Number:\s*(\d+)', re.IGNORECASE)
     qn_matches = list(qn_pattern.finditer(text))
@@ -234,7 +276,7 @@ def parse_answers(text):
         after_end   = qn_matches[idx + 1].start() if idx + 1 < len(qn_matches) else len(text)
         block       = text[after_start:after_end]
 
-        correct_match = re.search(r'Correct Answer:\s*([A-D])\.', block, re.IGNORECASE)
+        correct_match = re.search(r'Correct Answer:\s*([A-F])\.', block, re.IGNORECASE)
         if not correct_match:
             continue
 
@@ -250,8 +292,8 @@ def parse_answers(text):
         option_wise_match = re.search(r'Option-wise Explanation:(.*)', block, re.DOTALL | re.IGNORECASE)
         if option_wise_match:
             opt_text = option_wise_match.group(1)
-            for letter in ['A', 'B', 'C', 'D']:
-                opt_match = re.search(rf'{letter}\.\s*(.*?)(?=\n[A-D]\.\s|\Z)', opt_text, re.DOTALL)
+            for letter in OPTION_LETTERS:
+                opt_match = re.search(rf'{letter}\.\s*(.*?)(?=\n[A-F]\.\s|\Z)', opt_text, re.DOTALL)
                 if opt_match:
                     option_explanations[letter] = clean_text(opt_match.group(1))
 
@@ -269,8 +311,154 @@ def strip_option_prefix(explanation, option_text):
         return explanation
     if explanation.lower().startswith(option_text.lower()):
         remainder = explanation[len(option_text):].lstrip(' :-–—')
-        return remainder or explanation
+        if not remainder:
+            return explanation
+        # Removing the repeated option text leaves a sentence fragment starting
+        # mid-thought ("wrong; this refers to..."), so the first letter is
+        # restored to upper case.
+        return remainder[0].upper() + remainder[1:]
     return explanation
+
+
+# ── Prose format ─────────────────────────────────────────────────────────────
+# A second paper layout, with no bracketed metadata:
+#
+#   Question 1
+#   <stem paragraphs>
+#   Which one of the following is the most appropriate management?
+#   A. First option B. Second option C. Third option
+#
+# and answers as:
+#
+#   Q1 — Answer: C. Third option
+#   <explanation paragraphs>
+#   ● A. First option — wrong; ...
+#
+# Note the options run inline and wrap mid-option across lines, so they cannot
+# be split on newlines the way the labelled format is.
+
+_PROSE_QUESTION_RE = re.compile(r'(?m)^Question\s+(\d+)\s*$')
+# Consumes the rest of the answer line: it repeats the correct option's text
+# ("Answer: C. Maintain sertraline at 50 mg daily"), which would otherwise be
+# read as the opening words of the explanation.
+_PROSE_ANSWER_RE = re.compile(r'(?m)^Q(\d+)\s*[—–-]\s*Answer:\s*([A-F])[.:]?[^\n]*')
+
+
+def _split_inline_options(chunk):
+    """Separate an inline 'A. x B. y C. z' run from the stem before it.
+
+    Only a run that starts at A and steps forward one letter at a time counts,
+    so an 'A.' inside the stem cannot start the options early — the sequence
+    has to continue with B for anything to be taken as an option.
+    """
+    flat = ' '.join(chunk.split())
+
+    markers = []
+    for match in re.finditer(r'(?:(?<=\s)|^)([A-F])\.\s', flat):
+        if match.group(1) == OPTION_LETTERS[len(markers)]:
+            markers.append(match)
+            if len(markers) == len(OPTION_LETTERS):
+                break
+
+    if len(markers) < 2:
+        return flat, {}
+
+    options = {}
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(flat)
+        options[marker.group(1)] = clean_text(flat[marker.end():end])
+
+    return clean_text(flat[:markers[0].start()]), options
+
+
+def _parse_questions_prose(text, page_starts=None):
+    questions = []
+    matches = list(_PROSE_QUESTION_RE.finditer(text))
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+
+        question_text, options = _split_inline_options(text[start:end])
+        if len(options) < 2 or not question_text:
+            continue
+
+        questions.append({
+            "question_number": int(match.group(1)),
+            # This format carries no subject/topic/difficulty markers. They are
+            # left unset rather than guessed, and can be filled in from the
+            # admin question editor.
+            "subject":         None,
+            "topic":           None,
+            "difficulty":      None,
+            "source_type":     "recall",
+            "question_type":   "single_choice",
+            "marks":           1,
+            "negative_marks":  1,
+            "image_present":   False,
+            "image_type":      None,
+            "page_number":     page_for_offset(page_starts, match.start()),
+            "question_text":   question_text,
+            "options":         options,
+        })
+
+    return questions
+
+
+def _parse_answers_prose(text):
+    answers = {}
+    matches = list(_PROSE_ANSWER_RE.finditer(text))
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block = text[start:end]
+
+        # The per-option notes are bulleted; everything before the first bullet
+        # is the explanation of the correct answer.
+        bullet_split = re.split(r'[●•]', block, maxsplit=1)
+        explanation = clean_text(' '.join(bullet_split[0].split()))
+
+        option_explanations = {}
+        for bullet in re.findall(r'[●•]\s*([A-F])\.\s*([^●•]+)', block):
+            option_explanations[bullet[0]] = clean_text(' '.join(bullet[1].split()))
+
+        answers[int(match.group(1))] = {
+            "correct_answer":      match.group(2).upper(),
+            "explanation":         explanation or None,
+            "option_explanations": option_explanations,
+        }
+
+    return answers
+
+
+# ── Format dispatch ──────────────────────────────────────────────────────────
+
+def parse_questions(text, page_starts=None):
+    """Parse either paper layout.
+
+    The labelled format is tried first and only falls back when it yields
+    nothing, so a paper that parsed before keeps parsing exactly as it did.
+    """
+    labelled = _parse_questions_labelled(text)
+    if labelled:
+        print(f"[parser] questions: labelled format, {len(labelled)} found")
+        return labelled
+
+    prose = _parse_questions_prose(text, page_starts)
+    print(f"[parser] questions: prose format, {len(prose)} found")
+    return prose
+
+
+def parse_answers(text):
+    labelled = _parse_answers_labelled(text)
+    if labelled:
+        print(f"[parser] answers: labelled format, {len(labelled)} found")
+        return labelled
+
+    prose = _parse_answers_prose(text)
+    print(f"[parser] answers: prose format, {len(prose)} found")
+    return prose
 
 
 def merge_questions_answers(questions, answers, images_by_page=None,
@@ -384,13 +572,13 @@ async def import_pdfs(
 
         job_id = str(uuid.uuid4())
 
-        questions_text    = extract_pdf_text(questions_path)
+        questions_text, questions_pages = extract_pdf_text_pages(questions_path)
         answers_text      = extract_pdf_text(answers_path)
         questions_images  = extract_pdf_images(questions_path, job_id, prefix="q")
         answers_images    = extract_pdf_images(answers_path,   job_id, prefix="a")
         answer_page_map   = get_answer_page_map(answers_path)
 
-        parsed_questions = parse_questions(questions_text)
+        parsed_questions = parse_questions(questions_text, questions_pages)
         parsed_answers   = parse_answers(answers_text)
 
         final_questions = merge_questions_answers(
@@ -406,10 +594,21 @@ async def import_pdfs(
                 batch_id = await create_batch(client, title)
             await send_questions(client, batch_id, final_questions)
 
+        # A question with no entry in the answer paper imports with no correct
+        # option, so every student answering it is marked wrong. Reported rather
+        # than dropped: the question is still real, and the gap is usually a
+        # missing page in the answers PDF worth fixing at the source.
+        unanswered = [
+            q["question_number"]
+            for q in final_questions
+            if not any(o.get("is_correct") for o in q.get("options", []))
+        ]
+
         return {
-            "status":          "success",
-            "batch_id":        batch_id,
-            "total_questions": len(final_questions),
+            "status":                "success",
+            "batch_id":              batch_id,
+            "total_questions":       len(final_questions),
+            "questions_without_answer": unanswered,
         }
 
     except httpx.HTTPStatusError as e:
