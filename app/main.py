@@ -8,6 +8,7 @@ import pdfplumber
 import fitz  # PyMuPDF
 import httpx
 import re
+from collections import deque
 
 import cloudinary
 import cloudinary.uploader
@@ -265,6 +266,9 @@ def _parse_questions_labelled(text):
 
 
 def _parse_answers_labelled(text):
+    # question_number -> list of answer entries, in document order. A plain
+    # dict would silently let a later duplicate number overwrite an earlier
+    # one; merge_questions_answers pairs occurrences up in order instead.
     answers    = {}
     qn_pattern = re.compile(r'Question Number:\s*(\d+)', re.IGNORECASE)
     qn_matches = list(qn_pattern.finditer(text))
@@ -297,11 +301,11 @@ def _parse_answers_labelled(text):
                 if opt_match:
                     option_explanations[letter] = clean_text(opt_match.group(1))
 
-        answers[question_number] = {
+        answers.setdefault(question_number, []).append({
             "correct_answer":      answer_letter,
             "explanation":         explanation,
             "option_explanations": option_explanations if option_explanations else None,
-        }
+        })
 
     return answers
 
@@ -321,27 +325,49 @@ def strip_option_prefix(explanation, option_text):
 
 
 # ── Prose format ─────────────────────────────────────────────────────────────
-# A second paper layout, with no bracketed metadata:
+# A second paper layout, with no bracketed metadata. Papers we've seen mix two
+# question-header spellings *within the same document* (a paper stitched
+# together from more than one exam session):
 #
 #   Question 1
 #   <stem paragraphs>
 #   Which one of the following is the most appropriate management?
 #   A. First option B. Second option C. Third option
 #
-# and answers as:
+#   Q135. <stem, sometimes preceded by a short title line>
+#   A. First option B. Second option C. Third option
+#
+# and answers, similarly mixing "Answer:"/"Correct answer:", "."/")" after the
+# option letter, and the declaration sharing a line with the header or sitting
+# on its own line below it:
 #
 #   Q1 — Answer: C. Third option
 #   <explanation paragraphs>
 #   ● A. First option — wrong; ...
 #
-# Note the options run inline and wrap mid-option across lines, so they cannot
-# be split on newlines the way the labelled format is.
+#   Q203. <title line>
+#   Correct answer: C. Third option
+#   ● A. First option — Incorrect: ...
+#
+# Note options often run inline and wrap mid-option across lines, so they
+# cannot be split on newlines the way the labelled format is.
 
-_PROSE_QUESTION_RE = re.compile(r'(?m)^Question\s+(\d+)\s*$')
-# Consumes the rest of the answer line: it repeats the correct option's text
-# ("Answer: C. Maintain sertraline at 50 mg daily"), which would otherwise be
-# read as the opening words of the explanation.
-_PROSE_ANSWER_RE = re.compile(r'(?m)^Q(\d+)\s*[—–-]\s*Answer:\s*([A-F])[.:]?[^\n]*')
+_PROSE_QUESTION_RE = re.compile(
+    r'(?m)^(?:Question\s+(?P<n1>\d+)\s*$'
+    r'|Q(?P<n2>\d+)(?:\s*\([^)]*\))?\.\s*(?=\S))'
+)
+
+# Header only: "Q135.", "Q1 —", "Q140 (additional stem).". Deliberately loose
+# about what follows the number — the correct-answer declaration is found
+# separately within the block, since it can share this line or sit on the
+# next one.
+_PROSE_ANSWER_HEADER_RE = re.compile(r'(?m)^Q(\d+)(?:\s*\([^)]*\))?\s*[.—–-]')
+
+# "Answer: C.", "Correct answer: B —", "Answer: B)" — wherever it falls in the
+# block following a header.
+_PROSE_ANSWER_DECLARATION_RE = re.compile(
+    r'(?:Correct\s+answer|Answer)\s*:\s*([A-F])\s*[.)—–-]', re.IGNORECASE
+)
 
 
 def _split_inline_options(chunk):
@@ -349,12 +375,13 @@ def _split_inline_options(chunk):
 
     Only a run that starts at A and steps forward one letter at a time counts,
     so an 'A.' inside the stem cannot start the options early — the sequence
-    has to continue with B for anything to be taken as an option.
+    has to continue with B for anything to be taken as an option. Accepts
+    either 'A.' or 'A)' as the option marker — both appear across papers.
     """
     flat = ' '.join(chunk.split())
 
     markers = []
-    for match in re.finditer(r'(?:(?<=\s)|^)([A-F])\.\s', flat):
+    for match in re.finditer(r'(?:(?<=\s)|^)([A-F])[.)]\s', flat):
         if match.group(1) == OPTION_LETTERS[len(markers)]:
             markers.append(match)
             if len(markers) == len(OPTION_LETTERS):
@@ -384,7 +411,7 @@ def _parse_questions_prose(text, page_starts=None):
             continue
 
         questions.append({
-            "question_number": int(match.group(1)),
+            "question_number": int(match.group('n1') or match.group('n2')),
             # This format carries no subject/topic/difficulty markers. They are
             # left unset rather than guessed, and can be filled in from the
             # admin question editor.
@@ -406,28 +433,43 @@ def _parse_questions_prose(text, page_starts=None):
 
 
 def _parse_answers_prose(text):
+    # question_number -> list of answer entries, in document order — see the
+    # note on _parse_answers_labelled's `answers` for why this isn't a
+    # question_number -> entry dict.
     answers = {}
-    matches = list(_PROSE_ANSWER_RE.finditer(text))
+    matches = list(_PROSE_ANSWER_HEADER_RE.finditer(text))
 
     for index, match in enumerate(matches):
+        question_number = int(match.group(1))
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         block = text[start:end]
 
+        declaration = _PROSE_ANSWER_DECLARATION_RE.search(block)
+        if not declaration:
+            continue
+
+        # Skip past the rest of the declaration's line: it repeats the
+        # correct option's text ("Answer: C. Maintain sertraline at 50 mg
+        # daily"), which would otherwise be read as the opening words of the
+        # explanation.
+        line_end = block.find('\n', declaration.end())
+        body = block[line_end + 1:] if line_end != -1 else block[declaration.end():]
+
         # The per-option notes are bulleted; everything before the first bullet
         # is the explanation of the correct answer.
-        bullet_split = re.split(r'[●•]', block, maxsplit=1)
+        bullet_split = re.split(r'[●•]', body, maxsplit=1)
         explanation = clean_text(' '.join(bullet_split[0].split()))
 
         option_explanations = {}
-        for bullet in re.findall(r'[●•]\s*([A-F])\.\s*([^●•]+)', block):
-            option_explanations[bullet[0]] = clean_text(' '.join(bullet[1].split()))
+        for letter, exp_text in re.findall(r'[●•]\s*([A-F])[.)]\s*([^●•]+)', body):
+            option_explanations[letter] = clean_text(' '.join(exp_text.split()))
 
-        answers[int(match.group(1))] = {
-            "correct_answer":      match.group(2).upper(),
+        answers.setdefault(question_number, []).append({
+            "correct_answer":      declaration.group(1).upper(),
             "explanation":         explanation or None,
             "option_explanations": option_explanations,
-        }
+        })
 
     return answers
 
@@ -466,12 +508,26 @@ def merge_questions_answers(questions, answers, images_by_page=None,
     """
     Cloudinary URLs are already absolute (https://res.cloudinary.com/...) so
     base_url is no longer needed.
+
+    `answers` maps question_number -> list of answer entries in document
+    order. Some source papers bundle more than one exam session into a single
+    PDF pair with overlapping numbering (the same "Q166" printed once per
+    session, each time with unrelated content), so a plain "look up by
+    number" would silently pair a question with the wrong session's answer.
+    Popping each number's answers in the order they were found instead pairs
+    the Nth occurrence of a number in the questions with the Nth occurrence
+    in the answers — correct as long as both PDFs list their sessions in the
+    same relative order, which is how a paired question/answer set is put
+    together. A question number with no (or no more) queued answers is left
+    unanswered rather than guessed at.
     """
     merged = []
+    answer_queues = {n: deque(entries) for n, entries in answers.items()}
 
     for q in questions:
         q_no        = q["question_number"]
-        answer_data = answers.get(q_no, {})
+        queue       = answer_queues.get(q_no)
+        answer_data = queue.popleft() if queue else {}
 
         question_images = None
         if images_by_page and q.get("page_number"):
