@@ -1,9 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import tempfile
 import os
 import uuid
+import json
+import base64
+import asyncio
 import pdfplumber
 import fitz  # PyMuPDF
 import httpx
@@ -23,6 +26,18 @@ load_dotenv(dotenv_path=_env_path)
 # ==========================================
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000").strip()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+# ── QBank extraction (Claude vision) ──────────────────────────────────────────
+# Only the /import/qbank endpoint uses these. The recall /import path does not
+# touch Claude, so the service still runs fine with no key set.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+QBANK_MODEL       = os.getenv("QBANK_MODEL", "claude-haiku-4-5").strip()
+# How many pages to read from Claude at once. 5 is comfortably under the default
+# rate limits and keeps a 400-page PDF to a few minutes.
+QBANK_CONCURRENCY = int(os.getenv("QBANK_CONCURRENCY", "5"))
+# Render DPI for each page image. 130 keeps the long edge near Anthropic's
+# 1568px downscale threshold, so higher values cost more tokens for no gain.
+QBANK_DPI         = int(os.getenv("QBANK_DPI", "130"))
 
 _cloud_name   = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
 _cloud_key    = os.getenv("CLOUDINARY_API_KEY",    "").strip()
@@ -678,3 +693,637 @@ async def import_pdfs(
             os.remove(questions_path)
         if answers_path and os.path.exists(answers_path):
             os.remove(answers_path)
+
+
+# ==========================================
+# QBANK IMPORT (single screenshot PDF → Claude vision)
+# ==========================================
+#
+# The recall /import above parses a text PDF pair with regex. QBank source PDFs
+# are a different animal: exports of another quiz app, one screenshot per page,
+# no selectable text at all. Each question spans two pages —
+#
+#   odd page  : the stem + options with empty radio circles
+#   even page : the same stem + every option's "CORRECT."/"INCORRECT."
+#               explanation, a check icon on the right answer
+#
+# so the even pages carry everything. Each even page is sent to Claude, which
+# returns the stem, the options in order, which one is correct, each
+# explanation, and a best-guess subject. Results are merged by question number
+# and pushed to the same /receive endpoint the recall importer uses.
+
+OPTION_KEYS = "ABCDEFGH"
+
+# Kept short and closed so findOrCreateSubject on the backend does not accumulate
+# a dozen spellings of "O&G". The admin can still retag anything in the batch
+# editor.
+QBANK_SUBJECTS = [
+    "Medicine",
+    "Surgery",
+    "Obstetrics & Gynaecology",
+    "Paediatrics",
+    "Psychiatry",
+    "General Practice",
+    "Emergency Medicine",
+    "Ethics & Law",
+    "Population Health",
+]
+
+_QBANK_PROMPT = (
+    "You are extracting one multiple-choice medical exam question from a screenshot "
+    "of an online question bank (AMC or eMedici style).\n\n"
+    "A page is ANSWERED when the correct option is marked — highlighted in green "
+    "with a tick, and/or each option is followed by an explanation (which may begin "
+    '"CORRECT."/"INCORRECT." or may be a discussion paragraph). Otherwise it is '
+    "UNANSWERED (plain radio circles, no explanations). A page may also be a cover "
+    "or blank.\n\n"
+    "Reply with ONLY a JSON object, no markdown fences, exactly this shape:\n"
+    "{\n"
+    '  "has_answer": <true only if the correct option is marked or explanations are shown>,\n'
+    '  "question_number": <integer after the word "Question", or null>,\n'
+    '  "question_text": "<the full case/scenario, INCLUDING any investigation '
+    'results and the final lead-in question sentence, as one string>",\n'
+    f'  "subject": <one of {QBANK_SUBJECTS} or null>,\n'
+    '  "options": [\n'
+    '    { "text": "<option text exactly as shown, no leading letter>",\n'
+    '      "is_correct": <true only for the green / ticked / "CORRECT" option>,\n'
+    '      "explanation": "<why this option is right or wrong: the sentence(s) or '
+    'paragraph about THIS option, with any leading CORRECT./INCORRECT. word '
+    'removed; null if none shown>" }\n'
+    "  ],\n"
+    '  "key_points": [<short take-home learning points shown on the page (often '
+    'highlighted / bulleted near the bottom); [] if none>],\n'
+    '  "has_image": <true if a clinical figure is embedded in the page — an X-ray, '
+    "CT/MRI/ultrasound, ECG, clinical photograph, pathology slide, chart or "
+    "diagram. NOT buttons, icons, avatars or the answer-percentage bars>,\n"
+    '  "image_region": <[left, top, right, bottom] as fractions 0.0-1.0 of the '
+    "whole page. Box ONLY the figure itself — stop at its bottom edge, before the "
+    '"Choose the single best answer" line, the question text or any options. null '
+    "when has_image is false>\n"
+    "}\n\n"
+    "Rules:\n"
+    "- List options top to bottom in the order shown.\n"
+    "- On an answered page exactly one option has is_correct true.\n"
+    "- If has_answer is false, still list the option texts (is_correct false, "
+    "explanation null).\n"
+    "- Never invent an explanation or a correct answer that is not shown. If the "
+    "page is not a question at all, return has_answer false, question_number null, "
+    "empty options, has_image false."
+)
+
+
+def _render_page_png(pdf_path: str, page_number: int, dpi: int) -> bytes:
+    """One page of the PDF as PNG bytes, at the given DPI."""
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_number - 1]
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+
+def _render_page_region_png(pdf_path: str, page_number: int, frac_rect: tuple,
+                            dpi: int = 300, trim: bool = True) -> bytes:
+    """A rectangular region of a page (given as 0-1 fractions) as PNG bytes.
+
+    Higher DPI for the final crop because these are clinical figures a student
+    will zoom into. `trim` removes near-white page margins from the result.
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_number - 1]
+        r = page.rect
+        x0, y0, x1, y1 = frac_rect
+        clip = fitz.Rect(
+            r.x0 + x0 * r.width, r.y0 + y0 * r.height,
+            r.x0 + x1 * r.width, r.y0 + y1 * r.height,
+        )
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=clip)
+        png = pix.tobytes("png")
+        return _trim_whitespace(png) if trim else png
+    finally:
+        doc.close()
+
+
+def _figure_bbox(png_bytes: bytes):
+    """Locate the clinical figure on a rendered page by its pixel texture.
+
+    A page of text — including the dense explanation block on an eMedici answer
+    page — is near-white with thin dark strokes: very few mid-grey pixels per
+    row. An X-ray, scan or clinical photo is saturated with mid-grey. Measured
+    across real pages the figure band sits around a 0.40 mid-tone fraction and
+    every text band well under 0.20, so a 0.32 cut cleanly separates them (and
+    returns nothing on a page that has no figure).
+
+    Returns (left, top, right, bottom) as fractions of the page, or None.
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        g = Image.open(BytesIO(png_bytes)).convert("L")
+        small = g.resize((160, 720))
+        sw, sh = small.size
+        px = small.load()
+
+        LO, HI = 30, 222
+
+        def row_mid(y):
+            return sum(1 for x in range(sw) if LO < px[x, y] < HI) / sw
+
+        rows = [row_mid(y) for y in range(sh)]
+
+        # The figure's signature is a long run of rows that ALL carry heavy
+        # mid-tone — an X-ray/photo has no internal white gaps, whereas text
+        # (however dense) has a near-white row between every line. Allow only a
+        # lone gap row (a thin caption or label inside the image) to be bridged.
+        solid = [1 if r >= 0.28 else 0 for r in rows]
+        for y in range(1, sh - 1):
+            if not solid[y] and solid[y - 1] and solid[y + 1]:
+                solid[y] = 1
+
+        best = (0, 0)
+        cur = None
+        for y, v in enumerate(solid + [0]):
+            if v and cur is None:
+                cur = y
+            elif not v and cur is not None:
+                if (y - cur) > (best[1] - best[0]):
+                    best = (cur, y)
+                cur = None
+        top, bot = best
+
+        if (bot - top) < 0.08 * sh:
+            return None
+        if (sum(rows[top:bot]) / (bot - top)) < 0.33:
+            return None
+
+        # Reject a flat colour fill (e.g. a solid footer band): a real figure
+        # has plenty of tonal variation.
+        from PIL import ImageStat
+        band = small.crop((0, top, sw, bot))
+        if ImageStat.Stat(band).stddev[0] < 14:
+            return None
+
+        def col_mid(x):
+            return sum(1 for y in range(top, bot) if LO < px[x, y] < HI) / (bot - top)
+
+        cols = [x for x in range(sw) if col_mid(x) >= 0.18]
+        left, right = (cols[0], cols[-1] + 1) if cols else (0, sw)
+
+        m = 0.006
+        return (
+            max(0.0, left / sw - m), max(0.0, top / sh - m),
+            min(1.0, right / sw + m), min(1.0, bot / sh + m),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[qbank] figure-bbox detection skipped: {e}")
+        return None
+
+
+def _trim_whitespace(png_bytes: bytes) -> bytes:
+    """Crop away rows/columns that are almost entirely page-white.
+
+    Claude's bounding box usually overshoots downward onto the question text.
+    The figure itself carries dark or coloured pixels (an X-ray's black
+    surround, a photo, a chart), so trimming near-white margins reliably tightens
+    it. Falls back to the untrimmed image if the detection looks unsafe.
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        img = Image.open(BytesIO(png_bytes)).convert("RGB")
+        W, H = img.size
+        small = img.convert("L").resize((min(W, 240), min(H, 320)))
+        sw, sh = small.size
+        px = small.load()
+
+        WHITE = 238
+        ROW_WHITE_FRAC = 0.985
+
+        def row_is_content(y):
+            non_white = sum(1 for x in range(sw) if px[x, y] < WHITE)
+            return non_white > (1 - ROW_WHITE_FRAC) * sw
+
+        def col_is_content(x):
+            non_white = sum(1 for y in range(sh) if px[x, y] < WHITE)
+            return non_white > (1 - ROW_WHITE_FRAC) * sh
+
+        rows = [y for y in range(sh) if row_is_content(y)]
+        cols = [x for x in range(sw) if col_is_content(x)]
+        if not rows or not cols:
+            return png_bytes
+
+        margin = 0.01
+        top = max(0.0, rows[0] / sh - margin)
+        bot = min(1.0, (rows[-1] + 1) / sh + margin)
+        left = max(0.0, cols[0] / sw - margin)
+        right = min(1.0, (cols[-1] + 1) / sw + margin)
+
+        # Bail if the trim is trivial or implausible.
+        if (bot - top) < 0.1 or (right - left) < 0.1:
+            return png_bytes
+        if (bot - top) > 0.98 and (right - left) > 0.98:
+            return png_bytes
+
+        box = (int(left * W), int(top * H), int(right * W), int(bot * H))
+        out = BytesIO()
+        img.crop(box).save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:  # noqa: BLE001
+        print(f"[qbank] whitespace trim skipped: {e}")
+        return png_bytes
+
+
+def _pages_to_read(total_pages: int, mode: str) -> list:
+    """Which page numbers to send to Claude.
+
+    'answered' (default) sends only the even pages — the ones carrying the
+    explanations in this export format. 'all' sends every page and is the
+    fallback for a PDF whose parity is off (a long answer that spilled onto a
+    third page shifts everything after it).
+    """
+    if mode == "all":
+        return list(range(1, total_pages + 1))
+    return list(range(2, total_pages + 1, 2))
+
+
+async def _extract_page(client, sem, pdf_path: str, page_number: int) -> Optional[dict]:
+    """Ask Claude to read one page. Returns the parsed dict, or None on failure."""
+    async with sem:
+        # Render inside the semaphore so only a few page images are held in
+        # memory at once, not the whole PDF's worth.
+        png = await asyncio.to_thread(_render_page_png, pdf_path, page_number, QBANK_DPI)
+        b64 = base64.standard_b64encode(png).decode("ascii")
+
+        for attempt in range(3):
+            try:
+                resp = await client.messages.create(
+                    model=QBANK_MODEL,
+                    max_tokens=2000,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": "image/png", "data": b64,
+                            }},
+                            {"type": "text", "text": _QBANK_PROMPT},
+                        ],
+                    }],
+                )
+                text = "".join(b.text for b in resp.content if b.type == "text").strip()
+                # Strip a stray ```json fence if the model adds one.
+                if text.startswith("```"):
+                    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
+                data = json.loads(text)
+                data["_page"] = page_number
+                return data
+            except json.JSONDecodeError:
+                if attempt == 2:
+                    print(f"[qbank] page {page_number}: unparseable response, skipped")
+                    return None
+            except Exception as e:  # noqa: BLE001 — one bad page must not sink the run
+                if attempt == 2:
+                    print(f"[qbank] page {page_number}: {e}")
+                    return None
+                await asyncio.sleep(2 * (attempt + 1))
+    return None
+
+
+def _score(entry: dict) -> tuple:
+    """How good an extraction is — an answered page with more explanations wins."""
+    opts = entry.get("options") or []
+    return (
+        1 if entry.get("has_answer") else 0,
+        sum(1 for o in opts if o.get("explanation")),
+        len(opts),
+    )
+
+
+def _to_backend_question(number: int, entry: dict):
+    """Map one merged extraction to the /receive question shape, or None to skip."""
+    opts = entry.get("options") or []
+    stem = (entry.get("question_text") or "").strip()
+
+    if not entry.get("has_answer") or len(opts) < 2 or not stem:
+        return None
+    if not any(o.get("is_correct") for o in opts):
+        return None
+
+    subject = entry.get("subject")
+    if subject not in QBANK_SUBJECTS:
+        subject = None
+
+    # Take-home points → the question-level explanation, shown as the summary note.
+    points = [p.strip() for p in (entry.get("key_points") or []) if isinstance(p, str) and p.strip()]
+    explanation = "\n".join(f"• {p}" for p in points) or None
+
+    images = [u for u in (entry.get("_image_urls") or []) if u]
+
+    return {
+        "question_number": number,
+        "question_text": stem,
+        "subject": subject,
+        "source_type": "qbank",
+        "question_type": "image_based" if images else "single_choice",
+        "marks": 1,
+        "negative_marks": 0,
+        "explanation": explanation,
+        **({"images": images} if images else {}),
+        "options": [
+            {
+                "option_key": OPTION_KEYS[i] if i < len(OPTION_KEYS) else str(i + 1),
+                "option_text": (o.get("text") or "").strip(),
+                "is_correct": bool(o.get("is_correct")),
+                "explanation": (o.get("explanation") or None),
+            }
+            for i, o in enumerate(opts)
+        ],
+    }
+
+
+def _clamp_region(region, pad):
+    try:
+        x0, y0, x1, y1 = (float(v) for v in region)
+    except (TypeError, ValueError):
+        return None
+    x0, y0 = max(0.0, x0 - pad), max(0.0, y0 - pad)
+    x1, y1 = min(1.0, x1 + pad), min(1.0, y1 + pad)
+    if x1 - x0 < 0.06 or y1 - y0 < 0.03:
+        return None
+    return (x0, y0, x1, y1)
+
+
+async def _upload_question_image(http, sem, pdf_path: str, page_number: int, region) -> Optional[str]:
+    """Crop the figure out of a page and store it via the backend. Returns the
+    path the question row should carry, or None on any failure (non-fatal — the
+    question still imports, just without the picture).
+
+    The crop box comes from `_figure_bbox` (pixel-texture detection on a
+    full-page render), which is far more reliable than the model's own bounding
+    box. The model's `image_region` is only the fallback when detection finds
+    nothing.
+    """
+    async with sem:
+        try:
+            full = await asyncio.to_thread(_render_page_png, pdf_path, page_number, 150)
+            box = _figure_bbox(full) or _clamp_region(region, 0.03)
+            if not box:
+                return None
+
+            png = await asyncio.to_thread(
+                _render_page_region_png, pdf_path, page_number, box, 300, True
+            )
+            resp = await http.post(
+                f"{BACKEND_URL}/api/admin/import-batches/images",
+                files={"image": (f"q-p{page_number}.png", png, "image/png")},
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            return resp.json().get("path")
+        except Exception as e:  # noqa: BLE001
+            print(f"[qbank] image for page {page_number} failed: {e}")
+            return None
+
+
+async def _process_qbank(pdf_path: str, batch_id: int, mode: str, explicit_pages: Optional[list] = None):
+    """Background job: read the PDF with Claude and push the questions to the backend.
+
+    `explicit_pages` (1-based) reads exactly those pages and skips the gap sweep —
+    used to backfill a handful of questions the first pass missed without
+    re-reading the whole PDF.
+    """
+    try:
+        import anthropic
+    except ImportError:
+        await _mark_batch_failed(batch_id, ["anthropic package not installed on the import service"])
+        _safe_unlink(pdf_path)
+        return
+
+    if not ANTHROPIC_API_KEY:
+        await _mark_batch_failed(batch_id, ["ANTHROPIC_API_KEY is not set on the import service"])
+        _safe_unlink(pdf_path)
+        return
+
+    try:
+        doc = fitz.open(pdf_path)
+        total_pages = doc.page_count
+        doc.close()
+
+        if explicit_pages:
+            pages = [p for p in explicit_pages if 1 <= p <= total_pages]
+        else:
+            pages = _pages_to_read(total_pages, mode)
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        sem = asyncio.Semaphore(max(1, QBANK_CONCURRENCY))
+
+        results = await asyncio.gather(*(
+            _extract_page(client, sem, pdf_path, p) for p in pages
+        ))
+
+        # An answered page whose "Question N" header scrolled off the top comes
+        # back with question_number null. Borrow the number from the page just
+        # before it (that page carries the same question's header) when we read
+        # it in this run.
+        by_page = {d["_page"]: d for d in results if d}
+        for data in results:
+            if data and data.get("has_answer") and not isinstance(data.get("question_number"), int):
+                prev = by_page.get(data["_page"] - 1)
+                if prev and isinstance(prev.get("question_number"), int):
+                    data["question_number"] = prev["question_number"]
+
+        # Merge by question number, keeping the richest extraction seen.
+        by_number: dict = {}
+        for data in results:
+            if not data:
+                continue
+            n = data.get("question_number")
+            if not isinstance(n, int):
+                continue
+            if n not in by_number or _score(data) > _score(by_number[n]):
+                by_number[n] = data
+
+        # If the "answered pages only" pass left gaps, sweep the neighbouring
+        # pages we skipped and merge anything new.
+        if not explicit_pages and mode != "all" and by_number:
+            expected = set(range(1, max(by_number) + 1))
+            missing = sorted(expected - set(by_number))
+            sweep = sorted({
+                p for n in missing for p in (2 * n - 1, 2 * n, 2 * n + 1)
+                if 1 <= p <= total_pages and p not in pages
+            })
+            if sweep:
+                print(f"[qbank] gap sweep over {len(sweep)} pages for {missing}")
+                extra = await asyncio.gather(*(
+                    _extract_page(client, sem, pdf_path, p) for p in sweep
+                ))
+                for data in extra:
+                    if not data:
+                        continue
+                    n = data.get("question_number")
+                    if not isinstance(n, int):
+                        continue
+                    if n not in by_number or _score(data) > _score(by_number[n]):
+                        by_number[n] = data
+
+        async with httpx.AsyncClient() as http:
+            # Crop + store every figure first, so the built questions carry image
+            # paths. Best-effort — a failed upload just leaves that question
+            # picture-less.
+            img_sem = asyncio.Semaphore(max(1, QBANK_CONCURRENCY))
+            with_images = [
+                d for d in by_number.values()
+                if d.get("has_image") and isinstance(d.get("_page"), int)
+            ]
+            if with_images:
+                print(f"[qbank] uploading {len(with_images)} question images")
+                urls = await asyncio.gather(*(
+                    _upload_question_image(http, img_sem, pdf_path, d["_page"], d["image_region"])
+                    for d in with_images
+                ))
+                for d, url in zip(with_images, urls):
+                    if url:
+                        d["_image_urls"] = [url]
+
+            questions, skipped = [], []
+            for n in sorted(by_number):
+                q = _to_backend_question(n, by_number[n])
+                (questions.append(q) if q else skipped.append(n))
+
+            if not questions:
+                await _mark_batch_failed(batch_id, [
+                    f"Read {total_pages} pages but found no usable answered questions.",
+                    "If this PDF has a cover page, or all the answers sit in a "
+                    "separate block of pages, re-upload with an explicit pages "
+                    "range (e.g. pages=121-240) or mode=all.",
+                    f"Skipped question numbers: {skipped}" if skipped else "",
+                ])
+                return
+
+            await _send_questions_with_logs(http, batch_id, questions, skipped)
+
+        img_count = sum(1 for q in questions if q.get("images"))
+        print(f"[qbank] batch {batch_id}: {len(questions)} imported ({img_count} with images), {len(skipped)} skipped")
+
+    except Exception as e:  # noqa: BLE001
+        print(f"[qbank] batch {batch_id} failed: {e}")
+        await _mark_batch_failed(batch_id, [f"QBank extraction crashed: {e}"])
+    finally:
+        _safe_unlink(pdf_path)
+
+
+def _safe_unlink(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+async def _mark_batch_failed(batch_id: int, logs: list):
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(
+                f"{BACKEND_URL}/api/admin/import-batches/{batch_id}/receive",
+                json={"status": "failed", "total_questions": 0, "questions": [],
+                      "logs": [l for l in logs if l]},
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                timeout=30,
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[qbank] could not mark batch {batch_id} failed: {e}")
+
+
+async def _send_questions_with_logs(http, batch_id: int, questions: list, skipped: list):
+    resp = await http.post(
+        f"{BACKEND_URL}/api/admin/import-batches/{batch_id}/receive",
+        json={
+            "status": "success",
+            "total_questions": len(questions) + len(skipped),
+            "questions": questions,
+            "logs": ([f"Skipped question numbers (no clear answer page): {skipped}"]
+                     if skipped else []),
+        },
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        timeout=180,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.post("/import/qbank")
+async def import_qbank(
+    background: BackgroundTasks,
+    pdf:   UploadFile = File(...),
+    title: str        = Form(...),
+    mode:  str        = Form("answered"),   # "answered" | "all"
+    pages: Optional[str] = Form(None),      # e.g. "41,42,43" — read exactly these
+):
+    """Turn a screenshot-export MCQ PDF into a qbank import batch.
+
+    Returns as soon as the batch row exists; the pages are read from Claude in
+    the background (10–20 min for ~400 pages). Watch the batch on the admin
+    Import Batches page — it flips from Processing to Completed / Failed.
+
+    Pass `pages` to read only a specific set — comma-separated, 1-based, ranges
+    allowed (e.g. "41,42,43" or "121-240"). Use this when the PDF keeps all its
+    answers in a separate block of pages (eMedici: questions 1–N, then answers
+    N+1–2N), or to backfill a few questions the first pass missed at a few cents.
+    """
+    if not pdf.filename or not pdf.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="pdf must be a .pdf file")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not set on the import service")
+    if mode not in ("answered", "all"):
+        raise HTTPException(status_code=400, detail="mode must be 'answered' or 'all'")
+
+    explicit_pages = None
+    if pages:
+        try:
+            picked = set()
+            for part in pages.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" in part:
+                    lo, hi = (int(x) for x in part.split("-", 1))
+                    picked.update(range(min(lo, hi), max(lo, hi) + 1))
+                else:
+                    picked.add(int(part))
+            explicit_pages = sorted(picked)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="pages must be integers or ranges like 121-240")
+        if not explicit_pages:
+            raise HTTPException(status_code=400, detail="pages was empty")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(await pdf.read())
+    tmp.close()
+
+    try:
+        doc = fitz.open(tmp.name)
+        page_count = doc.page_count
+        doc.close()
+    except Exception:
+        _safe_unlink(tmp.name)
+        raise HTTPException(status_code=400, detail="Could not open that PDF")
+
+    try:
+        async with httpx.AsyncClient() as http:
+            batch_id = await create_batch(http, title)
+    except httpx.HTTPStatusError as e:
+        _safe_unlink(tmp.name)
+        raise HTTPException(status_code=502, detail=f"Backend error creating batch: {e.response.text}")
+
+    background.add_task(_process_qbank, tmp.name, batch_id, mode, explicit_pages)
+
+    return {
+        "status": "processing",
+        "batch_id": batch_id,
+        "pdf_pages": page_count,
+        "reading_pages": len(explicit_pages) if explicit_pages else None,
+        "message": "Extraction started. Watch the batch status in the admin panel.",
+    }

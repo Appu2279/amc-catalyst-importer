@@ -7,3 +7,5 @@ PyMuPDF==1.26.5
 uvicorn==0.39.0
 cloudinary==1.44.0
 python-dotenv==1.0.1
+anthropic==0.125.0
+Pillow==11.3.0
