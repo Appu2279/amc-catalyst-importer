@@ -729,6 +729,60 @@ QBANK_SUBJECTS = [
     "Population Health",
 ]
 
+# One closed topic list per subject, for the same reason QBANK_SUBJECTS is
+# closed: thousands of questions tagged free-form end up under a dozen
+# spellings of each topic, and students filter by topic. Edit here; the admin
+# can still retag a question in the batch editor.
+QBANK_TOPICS = {
+    "Medicine": [
+        "Cardiology", "Respiratory", "Gastroenterology & Hepatology",
+        "Endocrinology & Diabetes", "Nephrology", "Neurology", "Haematology",
+        "Oncology", "Infectious Diseases", "Rheumatology & Immunology",
+        "Dermatology", "Geriatric Medicine", "Palliative Care",
+        "Clinical Pharmacology",
+    ],
+    "Surgery": [
+        "General Surgery", "Upper GI & Hepatobiliary", "Colorectal",
+        "Breast & Endocrine Surgery", "Vascular Surgery", "Urology",
+        "Orthopaedics", "Neurosurgery", "Trauma", "ENT", "Ophthalmology",
+        "Plastic Surgery & Burns", "Anaesthesia & Perioperative Care",
+    ],
+    "Obstetrics & Gynaecology": [
+        "Antenatal Care", "Complications of Pregnancy", "Labour & Delivery",
+        "Postnatal Care", "Gynaecology", "Contraception & Fertility",
+        "Gynaecological Oncology", "Menopause",
+    ],
+    "Paediatrics": [
+        "Neonatology", "Growth & Development", "Infections & Immunisation",
+        "Paediatric Emergencies", "Paediatric Medicine", "Paediatric Surgery",
+        "Child Protection", "Adolescent Health",
+    ],
+    "Psychiatry": [
+        "Mood Disorders", "Anxiety Disorders", "Psychotic Disorders",
+        "Substance Use", "Personality Disorders", "Child & Adolescent Psychiatry",
+        "Old Age Psychiatry & Dementia", "Eating Disorders", "Psychopharmacology",
+        "Risk Assessment & Mental Health Law",
+    ],
+    "General Practice": [
+        "Preventive Health & Screening", "Chronic Disease Management",
+        "Common Presentations", "Sexual Health", "Travel & Occupational Health",
+        "Aboriginal & Torres Strait Islander Health",
+    ],
+    "Emergency Medicine": [
+        "Resuscitation", "Shock & Sepsis", "Acute Cardiorespiratory",
+        "Acute Neurology", "Toxicology & Envenomation",
+        "Environmental Emergencies", "Emergency Procedures", "Acute Abdomen",
+    ],
+    "Ethics & Law": [
+        "Consent & Capacity", "Confidentiality", "Professionalism",
+        "End-of-Life Care", "Mandatory Reporting",
+    ],
+    "Population Health": [
+        "Epidemiology & Biostatistics", "Screening Programs",
+        "Public Health & Immunisation", "Evidence-Based Medicine",
+    ],
+}
+
 _QBANK_PROMPT = (
     "You are extracting one multiple-choice medical exam question from a screenshot "
     "of an online question bank (AMC or eMedici style).\n\n"
@@ -744,6 +798,8 @@ _QBANK_PROMPT = (
     '  "question_text": "<the full case/scenario, INCLUDING any investigation '
     'results and the final lead-in question sentence, as one string>",\n'
     f'  "subject": <one of {QBANK_SUBJECTS} or null>,\n'
+    '  "topic": <one topic from the list for the chosen subject (below), or null '
+    'if none fits>,\n'
     '  "options": [\n'
     '    { "text": "<option text exactly as shown, no leading letter>",\n'
     '      "is_correct": <true only for the green / ticked / "CORRECT" option>,\n'
@@ -762,6 +818,10 @@ _QBANK_PROMPT = (
     "when has_image is false>\n"
     "}\n\n"
     "Rules:\n"
+    "- Eye, ENT and orthopaedic questions are Surgery, whatever the setting.\n"
+    "- Topics by subject: "
+    + "; ".join(f"{subject}: {', '.join(topics)}" for subject, topics in QBANK_TOPICS.items())
+    + ".\n"
     "- List options top to bottom in the order shown.\n"
     "- On an answered page exactly one option has is_correct true.\n"
     "- If has_answer is false, still list the option texts (is_correct false, "
@@ -1015,6 +1075,9 @@ def _to_backend_question(number: int, entry: dict):
     subject = entry.get("subject")
     if subject not in QBANK_SUBJECTS:
         subject = None
+    topic = entry.get("topic")
+    if topic not in QBANK_TOPICS.get(subject, []):
+        topic = None
 
     # Take-home points → the question-level explanation, shown as the summary note.
     points = [p.strip() for p in (entry.get("key_points") or []) if isinstance(p, str) and p.strip()]
@@ -1026,6 +1089,7 @@ def _to_backend_question(number: int, entry: dict):
         "question_number": number,
         "question_text": stem,
         "subject": subject,
+        "topic": topic,
         "source_type": "qbank",
         "question_type": "image_based" if images else "single_choice",
         "marks": 1,
