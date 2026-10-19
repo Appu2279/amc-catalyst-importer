@@ -11,7 +11,7 @@ import pdfplumber
 import fitz  # PyMuPDF
 import httpx
 import re
-from collections import deque
+from collections import deque, Counter
 
 import cloudinary
 import cloudinary.uploader
@@ -87,6 +87,20 @@ def clean_text(text):
 # newer prose format uses five, so nothing downstream may assume four.
 OPTION_LETTERS = "ABCDEF"
 
+# A running page footer/header some source exports print on every page, with
+# no space between the page number and the text that follows it — e.g.
+# "Page 4Dr Solosailor's AMC Catalyst Questions 151 to 179". Because it's
+# glued rather than separated by whitespace, it lands stuck onto the end of
+# whatever real content happened to be last on that page (an option's text, an
+# explanation) instead of standing apart where a parser boundary could skip
+# it. Stripped per-page, right at extraction, since by the time pages are
+# concatenated there's no reliable boundary left to find it at.
+_PAGE_FOOTER_RE = re.compile(r"Page\s*\d+[A-Z][^\n]{0,80}?(?:Questions|Answers)\s+\d+\s+to\s+\d+\s*")
+
+
+def _strip_page_footer(page_text):
+    return _PAGE_FOOTER_RE.sub(' ', page_text) if page_text else page_text
+
 
 def extract_pdf_text_pages(pdf_path):
     """Same text as extract_pdf_text, plus where each page starts in it.
@@ -100,7 +114,7 @@ def extract_pdf_text_pages(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
         for index, page in enumerate(pdf.pages):
             page_starts.append((len(text), index + 1))
-            page_text = page.extract_text()
+            page_text = _strip_page_footer(page.extract_text())
             if page_text:
                 text += page_text + "\n"
     return text, page_starts
@@ -121,7 +135,7 @@ def extract_pdf_text(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text()
+            page_text = _strip_page_footer(page.extract_text())
             if page_text:
                 text += page_text + "\n"
     return text
@@ -185,15 +199,26 @@ def extract_pdf_images(pdf_path, job_id, prefix="img"):
     return images_by_page
 
 
+_ANSWER_PAGE_MAP_PATTERNS = (
+    re.compile(r'Question Number:\s*(\d+)', re.IGNORECASE),
+    re.compile(r'(?m)^Q(\d+)\s*[—–-]\s*Correct:', re.IGNORECASE),
+    re.compile(r'(?m)^Q(\d+)\.\s*Answer:\s*[A-F]\b', re.IGNORECASE),
+)
+
+
 def get_answer_page_map(pdf_path):
-    """Returns {question_number: page_number} by scanning each page of the answers PDF."""
+    """Returns {question_number: page_number} by scanning each page of the answers PDF.
+
+    Tries every known answer-header shape (labelled and bracketed formats) since
+    this runs before either parser has identified which one the PDF actually is.
+    """
     page_map = {}
-    qn_pattern = re.compile(r'Question Number:\s*(\d+)', re.IGNORECASE)
     with pdfplumber.open(pdf_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             page_text = page.extract_text() or ""
-            for match in qn_pattern.finditer(page_text):
-                page_map[int(match.group(1))] = page_idx + 1
+            for pattern in _ANSWER_PAGE_MAP_PATTERNS:
+                for match in pattern.finditer(page_text):
+                    page_map[int(match.group(1))] = page_idx + 1
     return page_map
 
 
@@ -489,29 +514,617 @@ def _parse_answers_prose(text):
     return answers
 
 
+# ── Bracketed format ─────────────────────────────────────────────────────────
+# A third paper layout:
+#
+#   Q1. [Cardiology] (Medium) A 62-year-old man presents with... Which of the
+#   following is the most appropriate immediate next step?
+#   A. Administer sublingual glyceryl trinitrate B. Administer intravenous
+#   atropine and avoid nitrates C. Proceed directly to primary PCI... D. ... E. ...
+#
+# and answers, keyed by option WORDING rather than letter:
+#
+#   Q1 — Correct: A Reference: ... Why A is correct: <explanation>
+#   ● B. GTN — drops preload further, can precipitate cardiogenic shock...
+#   ● C. ... ● D. ... ● E. ...
+#
+# The critical trap: the letter this format prints is NOT the same letter as
+# the question paper's for the same option — each PDF was generated with its
+# own independent shuffle of A-E. Cross-checking option wording between real
+# question/answer pairs confirms this (e.g. an option lettered A in the
+# question paper turns up lettered B in the answer key, verbatim). So unlike
+# the labelled and prose formats, merge_questions_answers cannot pair these by
+# letter — _resolve_bracketed_answer matches by wording instead, before the
+# normal letter-keyed merge ever runs.
+
+_BRACKETED_QUESTION_RE = re.compile(
+    # Not anchored to the start of a line: some source exports glue this
+    # header directly onto the end of the previous question's last option
+    # with no separating newline or space at all (a missing line break in the
+    # source, not a rendering artifact — confirmed by opening the PDF). The
+    # "Q<n>. [" shape is distinctive enough that matching it anywhere is safe.
+    r'Q(\d+)\.\s*\[([^\]]+)\]\s*'
+    # Difficulty is printed either "(Medium)" (captured here) or as one of the
+    # dash-separated tags below — but earlier batches print no difficulty at
+    # all, so this whole group is optional rather than required.
+    r'(?:\(([^)]+)\)\s*)?'
+    # Everything after that can be zero or more "— <tag>" segments in any
+    # order and combination — difficulty, a setting ("Hospital setting"),
+    # "Image-based", seen both alone and stacked ("— Hard — Hospital setting
+    # — Image-based"). Rather than model every combination, this just grabs
+    # the whole raw run as one span (group 4) so the parser can pull the
+    # difficulty/image-based signal out of it afterwards — the earlier
+    # per-tag alternation only ever matched ONE such segment and left any
+    # more stacked after it sitting unconsumed, leaking onto the front of the
+    # stem.
+    r'((?:\s*[—–-]\s*[^—–\-\n]+)*)\s*',
+    re.IGNORECASE,
+)
+
+
+def _parse_questions_bracketed(text, page_starts=None):
+    """Options run inline like the prose format and, in a well-formed source,
+    in strict A, B, C... order — so this reuses _split_inline_options rather
+    than the answer key's wording-based matching (see the format note above;
+    that shuffle is specific to the answer key, not the question paper).
+
+    Some source papers omit the stem's trailing '?' entirely (a lead-in
+    question implied rather than printed, e.g. "...no rib fractures are seen.
+    A. Insert a left intercostal catheter..."), so the split can't rely on
+    locating a question mark — it finds where the options begin instead,
+    which works whether or not the stem happens to end in one.
+    """
+    questions = []
+    matches = list(_BRACKETED_QUESTION_RE.finditer(text))
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block = ' '.join(text[start:end].split())
+
+        stem, options = _split_inline_options(block)
+        if len(options) < 2 or not stem:
+            continue
+
+        # A stray paragraph of leftover authoring notes occasionally lands on
+        # the last option — see _trim_runaway_tail.
+        letters = list(options)
+        texts = _trim_runaway_tail([options[letter] for letter in letters])
+        options = dict(zip(letters, texts))
+
+        subject_raw = match.group(2)
+        tag_suffix  = match.group(4) or ""
+        image_present = (
+            bool(re.search(r'image[\s-]*based', subject_raw, re.IGNORECASE))
+            or bool(re.search(r'image[\s-]*based', tag_suffix, re.IGNORECASE))
+            or bool(re.search(r'\(Image\s*\d+\)', stem, re.IGNORECASE))
+        )
+        subject_clean = re.sub(r'\s*[—,-]\s*image[\s-]*based\s*$', '', subject_raw, flags=re.IGNORECASE).strip()
+        # A compound label ("Public Health / Immunisation", "Ethics / Child
+        # Protection") is a subject/topic pair, not one subject — split it the
+        # same way the labelled format's two brackets already do.
+        if '/' in subject_clean:
+            subject_part, topic_part = subject_clean.split('/', 1)
+            subject, topic = subject_part.strip(), topic_part.strip() or None
+        else:
+            subject, topic = subject_clean, None
+
+        difficulty_match = re.search(r'\b(Easy|Medium|Hard)\b', tag_suffix, re.IGNORECASE)
+        difficulty_raw = match.group(3) or (difficulty_match.group(1) if difficulty_match else None)
+
+        questions.append({
+            "question_number": int(match.group(1)),
+            "subject":         clean_text(subject),
+            "topic":           clean_text(topic),
+            "difficulty":      clean_text(difficulty_raw).lower() if difficulty_raw else None,
+            "source_type":     "recall",
+            "question_type":   "image_based" if image_present else "single_choice",
+            "marks":           1,
+            "negative_marks":  0,
+            "image_present":   image_present,
+            "image_type":      None,
+            "page_number":     page_for_offset(page_starts, match.start()),
+            "question_text":   stem,
+            "options":         options,
+        })
+
+    return questions
+
+
+_BRACKETED_ANSWER_HEADER_RE = re.compile(r'(?m)^Q(\d+)\s*[—–-]\s*Correct:\s*[A-F]\b')
+_BRACKETED_WHY_RE           = re.compile(r'Why\s+[A-F]\s+is\s+correct:\s*', re.IGNORECASE)
+_BRACKETED_REFERENCE_RE     = re.compile(r'Reference:\s*(.*)', re.IGNORECASE | re.DOTALL)
+_BRACKETED_BULLET_RE        = re.compile(
+    r'[●•]\s*[A-F][.)]\s*(.*?)\s*[—–-]\s*(.*?)(?=[●•]|\Z)', re.DOTALL
+)
+
+
+def _parse_answers_bracketed(text):
+    """Raw per-question data for the bracketed answer key — deliberately does
+    NOT keep this format's own option letters (see the format note above);
+    only the wording is carried forward for _resolve_bracketed_answer to match
+    against the question paper's own lettering.
+    """
+    raw = {}
+    headers = list(_BRACKETED_ANSWER_HEADER_RE.finditer(text))
+
+    for index, header in enumerate(headers):
+        block_end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        block = text[header.end():block_end]
+
+        why_match = _BRACKETED_WHY_RE.search(block)
+        if not why_match:
+            continue
+
+        ref_match = _BRACKETED_REFERENCE_RE.search(block[:why_match.start()])
+        reference = clean_text(ref_match.group(1)) if ref_match else None
+
+        bullet_mark  = re.search(r'[●•]', block[why_match.end():])
+        why_end      = why_match.end() + bullet_mark.start() if bullet_mark else len(block)
+        why_text     = clean_text(block[why_match.end():why_end])
+
+        bullets = [
+            (clean_text(label), clean_text(explanation))
+            for label, explanation in _BRACKETED_BULLET_RE.findall(block[why_end:])
+        ]
+        if bullets:
+            labels, explanations = zip(*bullets)
+            bullets = list(zip(labels, _trim_runaway_tail(list(explanations))))
+
+        raw[int(header.group(1))] = {
+            "reference": reference,
+            "why_text":  why_text,
+            "bullets":   bullets,
+        }
+
+    return raw
+
+
+# A running section/batch title repeated in these source exports (e.g. "AMC
+# CAT 1 Style Questions — Batch 1 Answers (Q21–Q50)"), always its own literal
+# anchor and always the true start of the leaked run — unlike the vocabulary
+# below, this needs no junction-walking to locate where the leak begins.
+_RUNNING_HEADER_RE = re.compile(r'\bAMC\s+CAT[\s-]*\d*\b', re.IGNORECASE)
+
+_DRAFTING_LEAK_RE = re.compile(
+    r'\b(?:batch|numbering|answer key|regenerate|shuffled letters|'
+    r'consecutive same-letter|topic/diagnosis repeat|recycled stock phrase)\b',
+    re.IGNORECASE,
+)
+
+
+def _trim_runaway_tail(parts):
+    """Guard against these LLM-authored papers occasionally leaking a stray
+    paragraph of drafting chatter, or a running batch-title header repeated
+    between sections, onto the very last option/explanation of a block
+    (observed at export batch boundaries — e.g. "Continuing the numbering as
+    Q51-Q100..." or "AMC CAT 1 Style Questions — Batch 1 Answers (Q21–Q50)"
+    glued straight onto the prior question's last option, no punctuation in
+    between). The last item in a block runs to the next header with nothing
+    bounding its far end, so any such leak lands entirely on it; every other
+    item is bounded on both sides and unaffected.
+
+    Vocabulary like "batch" or "answer key" never belongs in an actual
+    clinical rationale, so wherever it turns up, the leak is walked back to
+    the last point a lowercase word runs straight into a capitalised one with
+    no sentence break — that join is where the drafting aside started. This
+    heuristic can overshoot when the leaked text is itself a multi-word title
+    ("AMC CAT 1 Style Questions" has its own internal lowercase-to-capital
+    joins), so the running-header anchor is checked first and, when found,
+    cuts right at its own start rather than walking backward through it.
+    Separately, and regardless of wording, an item wildly longer than its
+    siblings gets capped, since a genuine option is never that much longer
+    than the others in its own block.
+    """
+    if len(parts) < 2:
+        return parts
+    parts = list(parts)
+    last  = parts[-1]
+
+    header_leak = _RUNNING_HEADER_RE.search(last)
+    if header_leak and header_leak.start() > 15:
+        last = last[:header_leak.start()].rstrip()
+    else:
+        leak = _DRAFTING_LEAK_RE.search(last)
+        if leak and leak.start() > 15:
+            cut = 0
+            for junction in re.finditer(r'[a-z](\s)(?=[A-Z])', last[:leak.start()]):
+                cut = junction.start(1)
+            if cut:
+                last = last[:cut].rstrip()
+
+    other_lengths = [len(p) for p in parts[:-1]]
+    avg   = sum(other_lengths) / len(other_lengths)
+    limit = max(avg * 2.0, avg + 80, 120)
+    if len(last) > limit:
+        space_cut = last.rfind(' ', 0, int(limit))
+        last = last[:space_cut if space_cut > 0 else int(limit)].rstrip(' -—')
+
+    parts[-1] = last
+    return parts
+
+
+_MATCH_STOPWORDS = frozenset("""
+    a an the of is are was were be been being to and or but if then so than as at by for
+    from in into on onto with without within over under above below between during before
+    after this that these those it its his her their there here what which who whom when
+    where why how not no nor do does did doing has have had having will would shall should
+    can could may might must most more less very also each other same only just per one
+    two three
+""".split())
+
+
+def _tokenize_for_matching(text):
+    """Lowercased words, stopwords and crude plurals stripped, for comparing an
+    option's wording against a chunk of the answer key's prose.
+
+    Single-character tokens are kept — they're the only thing that
+    distinguishes options like "Hepatitis A/B/C infection", so dropping them
+    as noise erases the one signal that matters for that question.
+    """
+    tokens = []
+    for word in re.findall(r'[a-z0-9]+', (text or "").lower()):
+        if word in _MATCH_STOPWORDS:
+            continue
+        if len(word) > 3 and word.endswith('s') and not word.endswith('ss'):
+            word = word[:-1]
+        tokens.append(word)
+    return tokens
+
+
+def _weighted_overlap(option_tokens, weights, target_positions):
+    """Fraction of option_tokens' weight found in target_positions (a token ->
+    last-occurrence-index map), plus the latest position among only the
+    DISTINCTIVE matches (weight >= 0.5) — used to break ties between options
+    that share most of their wording (e.g. two dose options both ending
+    "mg/24 hours") in favour of whichever distinct value the target text
+    mentions last, since these explanations state background numbers before
+    concluding with the actual answer.
+    """
+    if not option_tokens:
+        return 0.0, -1
+    total = sum(weights[t] for t in option_tokens)
+    if total == 0:
+        return 0.0, -1
+    matched, last_distinctive_pos = 0.0, -1
+    for token in option_tokens:
+        pos = target_positions.get(token)
+        if pos is None:
+            continue
+        matched += weights[token]
+        if weights[token] >= 0.5:
+            last_distinctive_pos = max(last_distinctive_pos, pos)
+    return matched / total, last_distinctive_pos
+
+
+def _resolve_bracketed_answer(options, entry):
+    """Pair one question's options (as lettered in the question paper) against
+    its answer-key entry (as worded in the answer paper), matching by wording
+    rather than by letter — see the bracketed-format note above for why the
+    letters can't be trusted.
+
+    Each option's words are weighted by 1 / (how many of this question's OTHER
+    options also use that word), so template phrasing shared by every choice
+    (e.g. every option here ending "mg/24 hours") barely counts, and the words
+    that actually distinguish one option from its siblings decide the match.
+
+    The "why is correct" paragraph alone isn't a safe signal: it often mentions
+    a wrong option's wording too, to contrast against it (e.g. "...distinct
+    from dementia's chronic decline" when ruling OUT a dementia option). So
+    each option's score is *why-paragraph match minus its best match against
+    any "wrong" bullet* — an option that's actually correct is rarely also
+    the closest match to one of the bullets explaining why some other choice
+    is wrong. Ties (rounded, to dodge float noise) fall back to whichever
+    option's distinctive wording appears latest in the why-paragraph, since
+    these explanations tend to state background before concluding with the
+    actual answer (e.g. "his oral dose is 60mg, so the SC dose is ~30mg").
+    """
+    letters    = list(options)
+    opt_tokens = {letter: _tokenize_for_matching(options[letter]) for letter in letters}
+
+    doc_freq = Counter()
+    for letter in letters:
+        for token in set(opt_tokens[letter]):
+            doc_freq[token] += 1
+    weights = {token: 1.0 / count for token, count in doc_freq.items()}
+
+    why_tokens    = _tokenize_for_matching(entry.get("why_text"))
+    why_positions = {token: i for i, token in enumerate(why_tokens)}
+    why_scored    = {
+        letter: _weighted_overlap(opt_tokens[letter], weights, why_positions)
+        for letter in letters
+    }
+
+    bullets = list(entry.get("bullets") or [])
+    bullet_positions = []
+    for label, explanation in bullets:
+        tokens = _tokenize_for_matching(f"{label} {explanation}")
+        bullet_positions.append({t: i for i, t in enumerate(tokens)})
+
+    best_bullet_score = {}
+    for letter in letters:
+        best = 0.0
+        for positions in bullet_positions:
+            score, _ = _weighted_overlap(opt_tokens[letter], weights, positions)
+            best = max(best, score)
+        best_bullet_score[letter] = best
+
+    net_scored = {
+        letter: (round(why_scored[letter][0] - best_bullet_score[letter], 6), why_scored[letter][1])
+        for letter in letters
+    }
+    correct_letter = max(net_scored, key=net_scored.get)
+
+    # Whichever remaining options best match a "wrong" bullet get that
+    # bullet's explanation; matched greedily, most confident pair first, so a
+    # weak/ambiguous bullet doesn't steal an option a stronger bullet wants.
+    remaining_letters = [letter for letter in letters if letter != correct_letter]
+    candidates = []
+    for bullet_index, positions in enumerate(bullet_positions):
+        for letter in remaining_letters:
+            score, _ = _weighted_overlap(opt_tokens[letter], weights, positions)
+            candidates.append((score, bullet_index, letter))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    option_explanations = {}
+    used_bullets, used_letters = set(), set()
+    for score, bullet_index, letter in candidates:
+        if bullet_index in used_bullets or letter in used_letters:
+            continue
+        option_explanations[letter] = bullets[bullet_index][1]
+        used_bullets.add(bullet_index)
+        used_letters.add(letter)
+
+    explanation = entry.get("why_text") or None
+    if entry.get("reference"):
+        explanation = f"Reference: {entry['reference']}\n\n{explanation}" if explanation else f"Reference: {entry['reference']}"
+
+    return {
+        "correct_answer":      correct_letter,
+        "explanation":         explanation,
+        "option_explanations": option_explanations or None,
+    }
+
+
+def _resolve_bracketed_answers(raw_answers, questions_by_number):
+    answers = {}
+    for number, entry in raw_answers.items():
+        question = questions_by_number.get(number)
+        if not question or not question.get("options"):
+            continue
+        answers[number] = [_resolve_bracketed_answer(question["options"], entry)]
+    return answers
+
+
+# ── Reviewed format ──────────────────────────────────────────────────────────
+# A fourth answer-key layout, paired with the bracketed question paper above:
+#
+#   Q1. Answer: B — Autism spectrum disorder
+#   A. Incorrect — ODD involves hostile, defiant behaviour...
+#   B. Correct — social difficulty making friends, restricted/repetitive
+#   play... (Therapeutic Guidelines Australia — Autism Spectrum Disorder)
+#   C. Incorrect — ADHD is characterised by inattention...
+#   ...
+#
+# Unlike the bracketed answer key, every option is relisted under the SAME
+# letter as the question paper (confirmed by cross-checking wording), so this
+# merges by letter directly — no wording match needed.
+
+# Not anchored to the start of a line: earlier batches print this whole answer
+# key as continuous wrapped prose with no paragraph break between questions,
+# so a header or option marker lands at the start of a text line only by the
+# accident of where the previous sentence happened to wrap. Anchoring to `^`
+# silently swallowed every question whose header didn't land on a fresh line
+# into its predecessor's block.
+#
+# Not even anchored to a preceding whitespace character: some source exports
+# glue this header directly onto the closing ")" of the previous question's
+# last reference citation with no space or newline at all ("...Recognition)
+# Q9. [Cardiology]..."). The "Q<n>. ... Answer: <letter>" shape (optionally
+# with the bracketed category/difficulty tag in between, echoing the
+# bracketed question paper's own header) is distinctive enough to match
+# anywhere without a false hit.
+#
+# The header itself also has two variants: "Q1. Answer: B" all on one line, or
+# a "Q1. [Category] — Hard" line followed by "Answer: B — ..." on the next
+# line — and that second line sometimes carries a wrapped tag ("— Hard —
+# General practice setting —\nImage-based") or even a page-footer line
+# ("Page 5Dr Solosailor's...") glued in before "Answer:" ever appears. Rather
+# than modelling every shape of that in-between clutter, this skips up to 160
+# characters of *anything* looking for the next "Answer: <letter>" — short
+# enough that it can't leap over a real gap into a different question's
+# answer line (the shortest real per-question block is far longer than that),
+# but long enough to clear the longest observed clutter.
+_REVIEWED_ANSWER_HEADER_RE = re.compile(r'Q(\d+)\.[\s\S]{0,160}?Answer:\s*([A-F])\b')
+# The separator after "Correct"/"Incorrect" is a dash in some papers and a
+# plain period in others ("A. Incorrect. X-ray adds..." vs "A. Incorrect —
+# X-ray adds...") — consuming only an optional dash left that period sitting
+# on the front of every explanation. `[.\s—–-]*` eats any run of those
+# separator characters regardless of which one the source used.
+_REVIEWED_OPTION_MARKER_RE = re.compile(r'(?:(?<=\s)|^)([A-F])\.\s*(Correct|Incorrect)\b[.\s—–-]*')
+
+
+def _parse_answers_reviewed(text):
+    """One option is occasionally left out of the list entirely (seen from a
+    certain question on in one paper) — that option just ends up with no
+    wrong-answer explanation. The correct answer itself is unaffected, since
+    it's read from the header rather than inferred from which options got a
+    bullet.
+    """
+    answers = {}
+    headers = list(_REVIEWED_ANSWER_HEADER_RE.finditer(text))
+
+    for index, header in enumerate(headers):
+        block_end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        block = text[header.end():block_end]
+        header_letter = header.group(2)
+
+        markers = list(_REVIEWED_OPTION_MARKER_RE.finditer(block))
+        if not markers:
+            continue
+
+        entries = []
+        for i, marker in enumerate(markers):
+            seg_end = markers[i + 1].start() if i + 1 < len(markers) else len(block)
+            entries.append({
+                "letter":      marker.group(1),
+                "status":      marker.group(2),
+                "explanation": clean_text(block[marker.end():seg_end]),
+            })
+
+        # Every question's last entry runs to the next header with nothing
+        # else bounding its far end, so a running header/footer sitting
+        # between batches with no blank line before it ("AMC CAT 1 Style
+        # Questions — Batch 1 Answers (Q51–80)") lands glued onto whichever
+        # question happens to be last before it — see _trim_runaway_tail.
+        if len(entries) >= 2:
+            entries[-1]["explanation"] = _trim_runaway_tail(
+                [e["explanation"] for e in entries]
+            )[-1]
+
+        correct_entries = [e for e in entries if e["status"] == "Correct"]
+        if len(correct_entries) == 1:
+            correct_entry = correct_entries[0]
+        elif len(correct_entries) > 1:
+            # The source occasionally revises its own answer mid-explanation
+            # ("B. Correct (revised) — ..." after an earlier "A. Correct —"
+            # it then contradicts). Prefer whichever entry says so, else
+            # whichever matches the header, else the last one — a later
+            # entry corrects an earlier one here, never the reverse.
+            correct_entry = (
+                next((e for e in correct_entries if 'revised' in e["explanation"].lower()), None)
+                or next((e for e in correct_entries if e["letter"] == header_letter), None)
+                or correct_entries[-1]
+            )
+        else:
+            correct_entry = next((e for e in entries if e["letter"] == header_letter), None)
+
+        if not correct_entry:
+            continue
+
+        option_explanations = {
+            e["letter"]: e["explanation"]
+            for e in entries
+            if e is not correct_entry and e["explanation"]
+        }
+
+        answers[int(header.group(1))] = [{
+            "correct_answer":      correct_entry["letter"],
+            "explanation":         correct_entry["explanation"] or None,
+            "option_explanations": option_explanations or None,
+        }]
+
+    return answers
+
+
+# ── Concise format ───────────────────────────────────────────────────────────
+# A fifth answer-key layout:
+#
+#   Q1. Correct: A A) Correct — Start with a low replacement dose (25–50 mcg)
+#   and titrate based on repeat TSH... B) Ultrasound is not required to
+#   diagnose primary hypothyroidism... C) ... D) ... E) ... Reference: RACGP –
+#   Thyroid disease: diagnosis and management in general practice.
+#
+# The correct letter is only ever given once, in the header ("Correct: A") —
+# unlike the reviewed format, wrong options carry no "Incorrect" keyword at
+# all, they just state the critique directly, so the correct option is found
+# by matching the header's letter rather than by scanning option text for a
+# status word. Options are lettered the same way as the paired bracketed
+# question paper (confirmed by wording), so this merges by letter directly.
+
+_LETTERED_ANSWER_HEADER_RE = re.compile(r'Q(\d+)\.\s*Correct:\s*([A-F])\b')
+_LETTERED_REFERENCE_RE     = re.compile(r'\bReference:\s*(.*)', re.IGNORECASE | re.DOTALL)
+
+
+def _parse_answers_lettered(text):
+    answers = {}
+    headers = list(_LETTERED_ANSWER_HEADER_RE.finditer(text))
+
+    for index, header in enumerate(headers):
+        block_end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        block = ' '.join(text[header.end():block_end].split())
+        correct_letter = header.group(2)
+
+        # The reference note trails the last option with nothing else
+        # bounding it, so it's sliced off before splitting options — left in
+        # place it would otherwise read as the tail of the last option's text.
+        ref_match = _LETTERED_REFERENCE_RE.search(block)
+        reference = clean_text(ref_match.group(1)) if ref_match else None
+        opts_block = block[:ref_match.start()] if ref_match else block
+
+        _, options = _split_inline_options(opts_block)
+        if len(options) < 2 or correct_letter not in options:
+            continue
+
+        correct_text = re.sub(
+            r'^Correct\s*[—:-]*\s*', '', options[correct_letter], flags=re.IGNORECASE
+        ).strip()
+        option_explanations = {
+            letter: opt_text for letter, opt_text in options.items() if letter != correct_letter
+        }
+
+        explanation = correct_text or None
+        if reference:
+            explanation = f"Reference: {reference}\n\n{explanation}" if explanation else f"Reference: {reference}"
+
+        answers[int(header.group(1))] = [{
+            "correct_answer":      correct_letter,
+            "explanation":         explanation,
+            "option_explanations": option_explanations or None,
+        }]
+
+    return answers
+
+
 # ── Format dispatch ──────────────────────────────────────────────────────────
 
 def parse_questions(text, page_starts=None):
-    """Parse either paper layout.
+    """Parse any of the three paper layouts.
 
-    The labelled format is tried first and only falls back when it yields
-    nothing, so a paper that parsed before keeps parsing exactly as it did.
+    Each is tried in turn and only falls back when it yields nothing, so a
+    paper that parsed before keeps parsing exactly as it did.
     """
     labelled = _parse_questions_labelled(text)
     if labelled:
         print(f"[parser] questions: labelled format, {len(labelled)} found")
         return labelled
 
+    bracketed = _parse_questions_bracketed(text, page_starts)
+    if bracketed:
+        print(f"[parser] questions: bracketed format, {len(bracketed)} found")
+        return bracketed
+
     prose = _parse_questions_prose(text, page_starts)
     print(f"[parser] questions: prose format, {len(prose)} found")
     return prose
 
 
-def parse_answers(text):
+def parse_answers(text, questions_by_number=None):
+    """Parse any of the four answer-key layouts.
+
+    The bracketed format needs the parsed questions (to match option wording
+    against) — `questions_by_number` is only required for that path.
+    """
     labelled = _parse_answers_labelled(text)
     if labelled:
         print(f"[parser] answers: labelled format, {len(labelled)} found")
         return labelled
+
+    reviewed = _parse_answers_reviewed(text)
+    if reviewed:
+        print(f"[parser] answers: reviewed format, {len(reviewed)} found")
+        return reviewed
+
+    lettered = _parse_answers_lettered(text)
+    if lettered:
+        print(f"[parser] answers: lettered format, {len(lettered)} found")
+        return lettered
+
+    bracketed_raw = _parse_answers_bracketed(text)
+    if bracketed_raw:
+        resolved = _resolve_bracketed_answers(bracketed_raw, questions_by_number or {})
+        print(f"[parser] answers: bracketed format, {len(resolved)} found")
+        return resolved
 
     prose = _parse_answers_prose(text)
     print(f"[parser] answers: prose format, {len(prose)} found")
@@ -569,6 +1182,18 @@ def merge_questions_answers(questions, answers, images_by_page=None,
             }
             for letter, text in options.items()
         ]
+
+        # Some source papers skip a letter (e.g. a question's options run
+        # A, B, D, E with no C printed anywhere). is_correct and explanation
+        # above are already resolved per option object, not looked up again
+        # by letter, so relabelling option_key to run A, B, C, D... here is
+        # purely cosmetic — it cannot disturb which option is marked correct
+        # or which explanation belongs to which. A no-op when the source
+        # letters were already consecutive.
+        for position, option in enumerate(formatted_options):
+            if position < len(OPTION_LETTERS):
+                option["option_key"] = OPTION_LETTERS[position]
+        correct_answer = next((o["option_key"] for o in formatted_options if o["is_correct"]), None)
 
         merged.append({
             **q,
@@ -650,7 +1275,8 @@ async def import_pdfs(
         answer_page_map   = get_answer_page_map(answers_path)
 
         parsed_questions = parse_questions(questions_text, questions_pages)
-        parsed_answers   = parse_answers(answers_text)
+        questions_by_number = {q["question_number"]: q for q in parsed_questions}
+        parsed_answers   = parse_answers(answers_text, questions_by_number)
 
         final_questions = merge_questions_answers(
             parsed_questions,

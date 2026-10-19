@@ -8,7 +8,10 @@ environment (local first, then production).
 
     # 2. Merge into questions and push to a backend as a new qbank batch.
     BACKEND_URL=http://localhost:3000 ADMIN_TOKEN=... \
-      venv/bin/python scripts/qbank-pdf-to-batch.py push <pdf> <cache.json> "<title>" [--dry-run]
+      venv/bin/python scripts/qbank-pdf-to-batch.py push <pdf> <cache.json> "<title>" [--dry-run] [--only-pages=12,40]
+
+    --only-pages pushes just the questions that include any of those pages, to
+    top up a batch that is missing a few questions.
 
 Why not POST /import/qbank: that endpoint merges pages by question number,
 which assumes one numbering run per PDF. Exports stitched together from several
@@ -94,6 +97,18 @@ def is_same_question(a: set, b: set) -> bool:
     return bool(a and b) and len(a & b) / min(len(a), len(b)) >= 0.6
 
 
+def is_same_stem(a: str, b: str) -> bool:
+    """eMedici reuses option lists (e.g. the same five anticoagulants) across
+    different questions, so matching options alone can fold two different
+    questions together. Their full stems tell them apart."""
+    from difflib import SequenceMatcher
+
+    def normalise(text):
+        return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()[:200]
+
+    return SequenceMatcher(None, normalise(a), normalise(b)).ratio() >= 0.8
+
+
 def merge_pages(cache: dict) -> list:
     """Group pages into questions.
 
@@ -118,9 +133,21 @@ def merge_pages(cache: dict) -> list:
                 current["pages"].append(page_number)
             continue
 
+        stem = (data.get("question_text") or "").strip()
+
+        def is_repeat_of(group):
+            # Only question pages carry the full stem (answer screenshots are
+            # often scrolled to a fragment), so compare stems between those.
+            if not is_same_question(options, group["options"]):
+                return False
+            if data.get("has_answer") or not group["question_stems"]:
+                return True
+            return any(is_same_stem(stem, s) for s in group["question_stems"])
+
         if current is None or not is_same_question(options, current["options"]):
-            repeat = next((g for g in groups if is_same_question(options, g["options"])), None)
-            current = repeat or {"options": set(), "pages": [], "answers": [], "stems": [], "overflow": [], "figures": []}
+            repeat = next((g for g in groups if is_repeat_of(g)), None)
+            current = repeat or {"options": set(), "pages": [], "answers": [], "stems": [],
+                                 "question_stems": [], "overflow": [], "figures": []}
             if repeat is None:
                 groups.append(current)
             else:
@@ -129,7 +156,9 @@ def merge_pages(cache: dict) -> list:
 
         current["options"] |= options
         current["pages"].append(page_number)
-        current["stems"].append((data.get("question_text") or "").strip())
+        current["stems"].append(stem)
+        if not data.get("has_answer"):
+            current["question_stems"].append(stem)
         if data.get("has_answer"):
             current["answers"].append(data)
         if data.get("has_image"):
@@ -244,7 +273,16 @@ def crop_figure(pdf_path: str, figure_page: dict):
     """PNG of the figure on that page, or None when it can't be located."""
     page_number = figure_page["_page"]
     full = importer._render_page_png(pdf_path, page_number, 150)
-    box = find_dark_figure_bbox(full) or importer._clamp_region(figure_page.get("image_region"), 0.03)
+    dark = find_dark_figure_bbox(full)
+    region = importer._clamp_region(figure_page.get("image_region"), 0.03)
+    box = dark or region
+    # The pixel detector can lock onto one flat dark patch inside a figure (the
+    # grey brain at the top of a coronal CT) and crop the rest away. When its box
+    # is much smaller than the region the page reader marked, trust the region.
+    if dark and region:
+        area = lambda b: max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        if area(dark) < 0.5 * area(region):
+            box = region
     if not box:
         return None
     return importer._render_page_region_png(pdf_path, page_number, box, 300, False)
@@ -272,13 +310,16 @@ async def upload_figure(http, sem, pdf_path: str, figure_page: dict):
             return None
 
 
-async def push(pdf_path: str, cache_path: str, title: str, is_dry_run: bool):
+async def push(pdf_path: str, cache_path: str, title: str, is_dry_run: bool, only_pages: set = None):
     cache = load_cache(cache_path)
     if not cache:
         sys.exit(f"No cached pages in {cache_path} — run extract first")
 
     groups = merge_pages(cache)
     questions, skipped = build_questions(groups)
+    if only_pages:
+        questions = [q for q in questions if only_pages & set(q["_source_pages"])]
+        skipped = []
     with_images = [q for q in questions if q["_figure"]]
     no_subject = [q["question_number"] for q in questions if not q.get("subject")]
 
@@ -345,10 +386,14 @@ async def push(pdf_path: str, cache_path: str, title: str, is_dry_run: bool):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     is_dry_run = "--dry-run" in sys.argv
+    only_pages = next((
+        {int(p) for p in a.split("=", 1)[1].split(",") if p.strip()}
+        for a in sys.argv if a.startswith("--only-pages=")
+    ), None)
     if len(args) == 3 and args[0] == "extract":
         asyncio.run(extract(args[1], args[2]))
     elif len(args) == 4 and args[0] == "push":
-        asyncio.run(push(args[1], args[2], args[3], is_dry_run))
+        asyncio.run(push(args[1], args[2], args[3], is_dry_run, only_pages))
     else:
         sys.exit(__doc__)
 
