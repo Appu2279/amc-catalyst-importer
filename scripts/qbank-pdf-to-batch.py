@@ -285,7 +285,60 @@ def crop_figure(pdf_path: str, figure_page: dict):
             box = region
     if not box:
         return None
-    return importer._render_page_region_png(pdf_path, page_number, box, 300, False)
+    return trim_text_edges(importer._render_page_region_png(pdf_path, page_number, box, 300, False))
+
+
+def trim_text_edges(png_bytes: bytes) -> bytes:
+    """Cut stray lines of question text off the top and bottom of a crop.
+
+    A generous region often catches the stem line above a figure and the
+    "Which one of the following…" lead-in below it. Each sits apart from the
+    figure behind a gap of plain background rows and is short, so short bands
+    at either edge are dropped; the figure itself is always the tallest band.
+    """
+    from io import BytesIO
+    from PIL import Image
+
+    img = Image.open(BytesIO(png_bytes)).convert("RGB")
+    gray = img.convert("L")
+    width, height = gray.size
+    px = gray.load()
+    background = Counter(px[x, y] // 8 for x in range(0, width, 7) for y in range(0, height, 7)).most_common(1)[0][0]
+    is_blank = [
+        all(abs(px[x, y] // 8 - background) <= 1 for x in range(0, width, 3))
+        for y in range(height)
+    ]
+
+    bands, start = [], None
+    for y, blank in enumerate(is_blank + [True]):
+        if not blank and start is None:
+            start = y
+        elif blank and start is not None:
+            bands.append([start, y])
+            start = None
+    # Bands split by a gap of only a few rows are one block (a figure with a
+    # light seam, or a two-line caption).
+    merged = []
+    for band in bands:
+        if merged and band[0] - merged[-1][1] < 6:
+            merged[-1][1] = band[1]
+        else:
+            merged.append(band)
+    if len(merged) < 2:
+        return png_bytes
+
+    tallest = max(merged, key=lambda b: b[1] - b[0])
+    is_text_band = lambda b: b is not tallest and b[1] - b[0] < 0.07 * height
+    while merged and is_text_band(merged[0]):
+        merged.pop(0)
+    while merged and is_text_band(merged[-1]):
+        merged.pop()
+    top, bottom = max(0, merged[0][0] - 4), min(height, merged[-1][1] + 4)
+    if (top, bottom) == (0, height):
+        return png_bytes
+    out = BytesIO()
+    img.crop((0, top, width, bottom)).save(out, format="PNG")
+    return out.getvalue()
 
 
 async def upload_figure(http, sem, pdf_path: str, figure_page: dict):
